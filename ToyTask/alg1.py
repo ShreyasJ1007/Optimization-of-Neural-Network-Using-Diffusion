@@ -26,14 +26,8 @@ from context import SetEncoder, CrossAttention
 
 
 class ConditionedEstimator(GradLogPEstimator2d):
-    """The 1D U-Net, with context injected at EVERY block.
-
-    Task-5 option 3/4: rather than folding context into the input once, the
-    context vector is added to the TIMESTEP EMBEDDING. Since that embedding is
-    already broadcast into every ResnetBlock (down, middle and up), the context
-    reaches every block through a pathway the decoder already has - no new
-    machinery, and a short gradient path to every layer.
-
+    """
+    The 1D U-Net, with context injected at EVERY block.
     The forward body is the parent's, with one added line marked below.
     """
 
@@ -127,7 +121,7 @@ class DiffusionOptimiser(torch.nn.Module):
         self.register_buffer("w_mean", torch.zeros(n_params))
         self.register_buffer("w_std", torch.ones(n_params))
 
-    # -- normalisation ------------------------------------------------------
+    # -- normalisation 
     def fit_normaliser(self, w_pool):
         """Standardise using pool statistics. w_pool: (n_tasks, n_params)."""
         self.w_mean.copy_(w_pool.mean(dim=0))
@@ -139,7 +133,7 @@ class DiffusionOptimiser(torch.nn.Module):
     def denormalise(self, w):
         return w * self.w_std + self.w_mean
 
-    # -- the conditioned score ---------------------------------------------
+    # -- the conditioned score 
     def encode_context(self, batch_feats):
         """batch_feats: (B, N, feat_dim) -> context tokens (B, n_ctx, ctx_dim)."""
         return self.set_encoder(batch_feats)
@@ -160,7 +154,7 @@ class DiffusionOptimiser(torch.nn.Module):
         w_cond = self._apply_context(w, ctx) if ctx is not None else w
         return self.diffusion.estimator(w_cond, mask, mu, t)
 
-    # -- ALGORITHM 1: training ---------------------------------------------
+    # -- ALGORITHM 1: training 
     def compute_loss(self, w0, batch_feats, offset=1e-5):
         """One training step of Algorithm 1.
 
@@ -194,8 +188,8 @@ class DiffusionOptimiser(torch.nn.Module):
     @torch.no_grad()
     
     def sample(self, batch_feats, n_timesteps=None, stoc=False, generator=None):
-        """Generate parameters for the task described by batch_feats.
-
+        """
+        Generate parameters for the task described by batch_feats.
         Returns DENORMALISED parameters, ready to use.
         """
         n_timesteps = n_timesteps or self.n_timesteps
