@@ -33,23 +33,30 @@ class ConditionedEstimator(GradLogPEstimator2d):
 
     def __init__(self, dim, ctx_dim, **kw):
         super().__init__(dim, **kw)
+        # small MLP so the context vector can be added to the timestep embedding.
+        # it has to come out at width `dim` because that's what the blocks expect.
         self.ctx_mlp = torch.nn.Sequential(
             torch.nn.Linear(ctx_dim, dim * 4), Mish(),
             torch.nn.Linear(dim * 4, dim),
         )
 
     def forward(self, x, mask, mu, t, ctx_vec=None):
+        # turn the scalar time into an embedding the blocks can use
         t = self.time_pos_emb(t, scale=self.pe_scale)
         t = self.mlp(t)
 
         # >>> the one change: context joins the per-block conditioning signal
+        # every ResNet block already gets `t`, so piggy-backing on it is the
+        # cheapest way to make the mini-batch visible everywhere in the net.
         if ctx_vec is not None:
             t = t + self.ctx_mlp(ctx_vec)
         # <<<
 
+        # stack the reference mean and the noisy weights as 2 input channels
         x = torch.stack([mu, x], 1)
         mask = mask.unsqueeze(1)
 
+        # --- downsampling path: keep each output for the skip connections ---
         hiddens = []
         masks = [mask]
         for resnet1, resnet2, attn, downsample in self.downs:
@@ -57,19 +64,23 @@ class ConditionedEstimator(GradLogPEstimator2d):
             x = resnet1(x, mask_down, t)
             x = resnet2(x, mask_down, t)
             x = attn(x)
-            hiddens.append(x)
+            hiddens.append(x)                      # save for the way back up
             x = downsample(x * mask_down)
-            masks.append(mask_down[:, :, ::2])
+            masks.append(mask_down[:, :, ::2])     # mask halves in length too
 
+        # the last mask we pushed belongs to a resolution we never use
         masks = masks[:-1]
+
+        # --- bottleneck ---
         mask_mid = masks[-1]
         x = self.mid_block1(x, mask_mid, t)
         x = self.mid_attn(x)
         x = self.mid_block2(x, mask_mid, t)
 
+        # --- upsampling path: glue the saved skips back on ---
         for resnet1, resnet2, attn, upsample in self.ups:
             mask_up = masks.pop()
-            x = torch.cat((x, hiddens.pop()), dim=1)
+            x = torch.cat((x, hiddens.pop()), dim=1)   # skip connection
             x = resnet1(x, mask_up, t)
             x = resnet2(x, mask_up, t)
             x = attn(x)
@@ -77,6 +88,7 @@ class ConditionedEstimator(GradLogPEstimator2d):
 
         x = self.final_block(x, mask)
         output = self.final_conv(x * mask)
+        # drop the channel dim: we went in as (B, L) and we come out as (B, L)
         return (output * mask).squeeze(1)
 
 
@@ -107,41 +119,52 @@ class DiffusionOptimiser(torch.nn.Module):
             self.diffusion.estimator = ConditionedEstimator(
                 dim, ctx_dim=ctx_dim, n_feats=1)
 
-        # enc(B): labelled mini-batch -> permutation-invariant context tokens
+        # enc(B): labelled mini-batch -> permutation-invariant context tokens.
+        # permutation-invariant matters: shuffling the batch shouldn't change
+        # which weights we ask for.
         self.set_encoder = SetEncoder(in_dim=feat_dim, dim=ctx_dim, n_tokens=n_ctx)
 
-        # context injection into the weight sequence (zero-init => no-op at start)
-        self.lift = torch.nn.Conv1d(1, dim, 1)
+        # context injection into the weight sequence (zero-init => no-op at start).
+        # only used in 'input' mode; kept here so both modes share one __init__.
+        self.lift = torch.nn.Conv1d(1, dim, 1)        # (B,1,L) -> (B,dim,L)
         self.inject = CrossAttention(dim=dim, dim_ctx=ctx_dim)
-        self.project = torch.nn.Conv1d(dim, 1, 1)
+        self.project = torch.nn.Conv1d(dim, 1, 1)     # back down to (B,1,L)
+        # zero-init the projection so training starts from the unconditioned
+        # model and the context has to earn its way in.
         torch.nn.init.zeros_(self.project.weight)
         torch.nn.init.zeros_(self.project.bias)
 
-        # normalisation buffers, filled by fit_normaliser()
+        # normalisation buffers, filled by fit_normaliser().
+        # buffers (not parameters) so they get saved but never trained.
         self.register_buffer("w_mean", torch.zeros(n_params))
         self.register_buffer("w_std", torch.ones(n_params))
 
-    # -- normalisation 
+    # -- normalisation ------------------------------------------------------
     def fit_normaliser(self, w_pool):
         """Standardise using pool statistics. w_pool: (n_tasks, n_params)."""
         self.w_mean.copy_(w_pool.mean(dim=0))
+        # clamp the std: some coordinates barely move, and dividing by ~0
+        # would blow them up into nonsense.
         self.w_std.copy_(w_pool.std(dim=0).clamp_min(1e-3))
 
     def normalise(self, w):
+        # raw parameters -> roughly zero-mean, unit-scale (what diffusion wants)
         return (w - self.w_mean) / self.w_std
 
     def denormalise(self, w):
+        # inverse of the above — call this before actually using the weights
         return w * self.w_std + self.w_mean
 
-    # -- the conditioned score 
+    # -- the conditioned score ---------------------------------------------
     def encode_context(self, batch_feats):
         """batch_feats: (B, N, feat_dim) -> context tokens (B, n_ctx, ctx_dim)."""
         return self.set_encoder(batch_feats)
 
     def _apply_context(self, w, ctx):
         """Fold context into the weight sequence. (B, L) -> (B, L)."""
-        h = self.lift(w.unsqueeze(1))
-        h = self.inject(h, ctx)
+        h = self.lift(w.unsqueeze(1))            # widen so attention has room
+        h = self.inject(h, ctx)                  # weights attend to the batch
+        # residual add: at init `project` is zero, so this returns w unchanged
         return w + self.project(h).squeeze(1)
 
     def _score(self, w, mask, mu, t, ctx):
@@ -150,11 +173,12 @@ class DiffusionOptimiser(torch.nn.Module):
             # pool the context tokens to one vector, then condition every block
             ctx_vec = ctx.mean(dim=1) if ctx is not None else None
             return self.diffusion.estimator(w, mask, mu, t, ctx_vec=ctx_vec)
-        # 'input' mode: fold context into the sequence once, before the U-Net
+        # 'input' mode: fold context into the sequence once, before the U-Net.
+        # this is the weaker of the two — the ablation shows why.
         w_cond = self._apply_context(w, ctx) if ctx is not None else w
         return self.diffusion.estimator(w_cond, mask, mu, t)
 
-    # -- ALGORITHM 1: training 
+    # -- ALGORITHM 1: training ---------------------------------------------
     def compute_loss(self, w0, batch_feats, offset=1e-5):
         """One training step of Algorithm 1.
 
@@ -164,14 +188,17 @@ class DiffusionOptimiser(torch.nn.Module):
         """
         b = w0.shape[0]
         device = w0.device
-        mask = torch.ones_like(w0)
+        mask = torch.ones_like(w0)                 # no padding here, so all ones
         mu = torch.zeros_like(w0)                  # normalised space => mu = 0
 
-        # step 2: sample a noise level
+        # step 2: sample a noise level.
+        # one t per example, and the offset keeps us off the exact endpoints
+        # where the variance terms misbehave.
         t = torch.rand(b, dtype=w0.dtype, device=device)
         t = torch.clamp(t, offset, 1.0 - offset)
 
-        # steps 3-4: forward-diffuse toward mu, keeping the injected noise z
+        # steps 3-4: forward-diffuse toward mu, keeping the injected noise z.
+        # z is the answer key — it's what the network has to recover.
         xt, z = self.diffusion.forward_diffusion(w0, mask, mu, t)
 
         # step 5: predict the noise, conditioned on the mini-batch
@@ -179,20 +206,24 @@ class DiffusionOptimiser(torch.nn.Module):
         cum_noise = get_noise(t.unsqueeze(-1), self.diffusion.beta_min,
                             self.diffusion.beta_max, cumulative=True)
         pred = self._score(xt, mask, mu, t, ctx)
+        # the net outputs a score; rescaling by the noise std converts it into
+        # a noise prediction, so it's comparable with z below.
         pred = pred * torch.sqrt(1.0 - torch.exp(-cum_noise))
 
-        # step 6: squared error to the true noise
+        # step 6: squared error to the true noise.
+        # (+z rather than -z because the score points the opposite way)
         return ((pred + z) ** 2).sum() / (mask.sum())
 
     #ALGORITHM 2: sampling
     @torch.no_grad()
-    
+
     def sample(self, batch_feats, n_timesteps=None, stoc=False, generator=None):
         """
         Generate parameters for the task described by batch_feats.
         Returns DENORMALISED parameters, ready to use.
         """
         n_timesteps = n_timesteps or self.n_timesteps
+        # allow a single un-batched task to be passed in
         if batch_feats.dim() == 2:
             batch_feats = batch_feats.unsqueeze(0)
         b = batch_feats.shape[0]
@@ -200,6 +231,7 @@ class DiffusionOptimiser(torch.nn.Module):
 
         mask = torch.ones(b, self.n_params, device=device)
         mu = torch.zeros(b, self.n_params, device=device)
+        # encode the task once — it doesn't change as we denoise
         ctx = self.encode_context(batch_feats)
 
         # step 1: start from the prior plus noise
@@ -208,16 +240,20 @@ class DiffusionOptimiser(torch.nn.Module):
         # step 2: walk time backwards
         h = 1.0 / n_timesteps
         for i in range(n_timesteps):
+            # midpoint of the current interval, same t for the whole batch
             t = (1.0 - (i + 0.5) * h) * torch.ones(b, device=device)
             beta_t = get_noise(t.unsqueeze(-1), self.diffusion.beta_min,
                                self.diffusion.beta_max, cumulative=False)
             score = self._score(w, mask, mu, t, ctx)
             if stoc:
+                # SDE: deterministic drift plus a fresh kick of noise
                 dxt = (0.5 * (mu - w) - score) * beta_t * h
                 dxt = dxt + torch.randn_like(w) * torch.sqrt(beta_t * h)
             else:
+                # probability-flow ODE: no extra randomness, so a fixed seed
+                # gives the same weights every time
                 dxt = 0.5 * (mu - w - score) * beta_t * h
-            w = w - dxt
+            w = w - dxt          # minus, because we're integrating backwards
 
         # step 3: return, denormalised
         return self.denormalise(w)
