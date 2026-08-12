@@ -51,9 +51,12 @@ class Spec:
 
     def __init__(self, groups):
         self.groups = groups
+        # total scalars: what the flat vector must be long enough to hold
         self.total = sum(g.count * g.width for g in groups)
+        # total tokens: the sequence length the decoder will actually see
         self.n_units = sum(g.count for g in groups)
-        # a distinct integer type-id per group name, for the type embedding
+        # a distinct integer type-id per group name, for the type embedding.
+        # every unit in a group shares the same id, since they're interchangeable.
         self.type_ids = []
         for gi, g in enumerate(groups):
             self.type_ids.extend([gi] * g.count)
@@ -63,6 +66,8 @@ class Spec:
         out, off = [], 0
         for g in self.groups:
             n = g.count * g.width
+            # walk the vector left to right; the spec fixes the layout, so the
+            # order of `groups` has to match how the flat vector was packed
             block = flat[:, off:off + n].reshape(flat.shape[0], g.count, g.width)
             out.append(block)
             off += n
@@ -84,7 +89,9 @@ class ParamTokenizer(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.max_unit_width = max_unit_width
-        # one shared "in" projection: pad each unit to max_unit_width then project
+        # one shared "in" projection: pad each unit to max_unit_width then project.
+        # sharing it (rather than one projection per group) is what lets an
+        # unseen spec be tokenised without adding new parameters.
         self.proj_in = torch.nn.Linear(max_unit_width, dim)
         self.proj_out = torch.nn.Linear(dim, max_unit_width)
         self.type_emb = torch.nn.Embedding(max_types, dim)
@@ -94,21 +101,28 @@ class ParamTokenizer(torch.nn.Module):
         b, c, w = block.shape
         if w > self.max_unit_width:
             raise ValueError(f"unit width {w} exceeds max {self.max_unit_width}")
+        # right-pad with zeros so every unit hits the same width and can go
+        # through the single shared projection
         pad = torch.zeros(b, c, self.max_unit_width - w,
                           dtype=block.dtype, device=block.device)
         return torch.cat([block, pad], dim=-1)
 
     def forward(self, flat, spec):
         if flat.dim() == 1:
-            flat = flat.unsqueeze(0)
+            flat = flat.unsqueeze(0)          # allow a single un-batched vector
         blocks = spec.slice(flat)                       # per-group units
         tokens = []
         for block in blocks:
             padded = self._pad(block)                   # common width
             tokens.append(self.proj_in(padded))         # -> (B, count, dim)
+        # groups are concatenated in spec order, so token i always corresponds
+        # to the same structural unit
         tok = torch.cat(tokens, dim=1)                  # (B, n_units, dim)
-        # add the type embedding: THIS is the architecture tag per token
+        # add the type embedding: THIS is the architecture tag per token.
+        # without it, a "mean" token and a "log-std" token would be
+        # indistinguishable once projected.
         type_ids = torch.tensor(spec.type_ids, device=flat.device)
+        # same tag for every item in the batch, hence the broadcast unsqueeze(0)
         tok = tok + self.type_emb(type_ids).unsqueeze(0)
         return tok
 
@@ -118,7 +132,10 @@ class ParamTokenizer(torch.nn.Module):
         raw = self.proj_out(tok)                        # (B, n_units, max_width)
         out, ui = [], 0
         for g in spec.groups:
+            # take this group's tokens, then keep only the real columns —
+            # anything past g.width was padding on the way in
             block = raw[:, ui:ui + g.count, :g.width]   # trim to real width
             out.append(block.reshape(tok.shape[0], g.count * g.width))
             ui += g.count
+        # reassembled in spec order, so this is the exact inverse layout of slice()
         return torch.cat(out, dim=1)                    # (B, total)
