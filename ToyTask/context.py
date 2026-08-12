@@ -1,26 +1,6 @@
 """
 context.py — enc(B): turning a mini-batch into conditioning for the decoder.
 
-TASK 5/6 IMPLEMENTATION. Two modules, both literature-grounded:
-
-SetEncoder      the "how" - compress a variable-size, UNORDERED mini-batch
-                into a fixed number of context tokens.
-                Follows Set Transformer (Lee et al., ICML 2019): per-element
-                MLP -> self-attention over the set (SAB) -> Pooling by
-                Multihead Attention (PMA) with k learned seed vectors.
-                Permutation-invariant by construction: shuffling the batch
-                does not change the output. Mean-pooling (DeepSets, Zaheer
-                et al. 2017) is available as a baseline for ablation.
-
-CrossAttention  the "where" - inject those tokens into the U-Net.
-                Follows Latent Diffusion (Rombach et al., CVPR 2022):
-                queries come from the U-Net feature map, keys/values from
-                the context tokens, applied at each attention site.
-
-Why tokens rather than one vector: FiD (Izacard & Grave, EACL 2021) encodes
-each passage independently and lets the decoder attend over the concatenation,
-which avoids collapsing everything into a single vector too early.
-
 """
 
 import torch
